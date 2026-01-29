@@ -1,5 +1,5 @@
 const express = require('express');
-const { holdSeats, confirmBooking, insertSeats, cancelBooking, processPayment, getBookingPaymentDetails, setSeatPrice } = require('../services/booking.service');
+const { holdSeats, confirmBooking, insertSeats, cancelBooking, processPayment, getBookingPaymentDetails, setSeatPrice, createEvent, getAvailableSeats } = require('../services/booking.service');
 
 const router = express.Router();
 
@@ -76,12 +76,34 @@ router.post('/seats/insert', async (req, res) => {
   }
 });
 
+// Get all available seats for an event
+router.get('/seats/available/:eventId', async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const result = await getAvailableSeats(eventId);
+    res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
 // Cancel a booking
 router.post('/cancel', async (req, res) => {
   try {
     const { bookingId, eventDate, duration } = req.body;
     const result = await cancelBooking(bookingId, eventDate, duration);
     res.json(result);
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Create a new event
+router.post('/event', async (req, res) => {
+  try {
+    const { name, city, date, duration, seats } = req.body;
+    const event = await createEvent(name, city, date, duration, seats);
+    res.json(event);
   } catch (e) {
     res.status(400).json({ error: e.message });
   }

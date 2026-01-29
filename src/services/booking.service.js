@@ -206,6 +206,74 @@ async function setSeatPrice(eventId, seatPrice) {
   };
 }
 
+// Create a new event
+async function createEvent(name, city, date, duration, seats = []) {
+  if (!name || !date || !duration) {
+    throw new Error('Event name, date and duration are required');
+  }
+
+  const event = await Event.create({
+    name,
+    city,
+    date,
+    duration,
+    seats
+  });
+
+  return event;
+}
+
+// Get all available seats for an event
+async function getAvailableSeats(eventId) {
+  if (!eventId) {
+    throw new Error('Event ID is required');
+  }
+
+  const event = await Event.findById(eventId);
+  if (!event) {
+    throw new Error('Event not found');
+  }
+
+  const now = new Date();
+
+  // Find all confirmed booked seats
+  const bookedSeats = await Booking.find({
+    eventId,
+    status: 'CONFIRMED',
+    paymentStatus: 'COMPLETED'
+  }, { seats: 1 });
+
+  // Find all temporarily locked seats
+  const lockedSeats = await SeatLock.find({
+    eventId,
+    expiresAt: { $gt: now }
+  }, { seatId: 1 });
+
+  // Flatten booked seats array
+  const bookedSeatIds = bookedSeats.flatMap(booking => booking.seats);
+
+  // Flatten locked seat IDs
+  const lockedSeatIds = lockedSeats.map(lock => lock.seatId);
+
+  // Get unavailable seats (booked + locked)
+  const unavailableSeatIds = new Set([...bookedSeatIds, ...lockedSeatIds]);
+
+  // Get available seats
+  const availableSeats = event.seats.filter(seat => !unavailableSeatIds.has(seat));
+
+  return {
+    eventId,
+    totalSeats: event.seats.length,
+    availableSeats: availableSeats,
+    availableCount: availableSeats.length,
+    bookedCount: bookedSeatIds.length,
+    lockedCount: lockedSeatIds.length,
+    eventName: event.name,
+    eventDate: event.date,
+    duration: event.duration
+  };
+}
+
 // Insert new seats for an event
 async function insertSeats(eventId, seatList, eventDate, duration) {
   if (!Array.isArray(seatList) || seatList.length === 0) {
@@ -276,4 +344,4 @@ async function cancelBooking(bookingId, eventDate, duration) {
   };
 }
 
-module.exports = { holdSeats, confirmBooking, insertSeats, cancelBooking, processPayment, getBookingPaymentDetails, setSeatPrice };
+module.exports = { holdSeats, confirmBooking, insertSeats, cancelBooking, processPayment, getBookingPaymentDetails, setSeatPrice, createEvent, getAvailableSeats };
