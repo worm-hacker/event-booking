@@ -1,7 +1,13 @@
-const SeatLock = require('../models/SeatLock');
-const Booking = require('../models/Booking');
-const Price = require('../models/Price');
-const Event = require('../models/Event');
+const { sequelize } = require('../config/db');
+const { Op } = require('sequelize');
+
+// Get models from sequelize instance (lazy load to avoid circular dependency)
+const getModels = () => ({
+  SeatLock: sequelize.models.SeatLock,
+  Booking: sequelize.models.Booking,
+  Price: sequelize.models.Price,
+  Event: sequelize.models.Event
+});
 
 const HOLD_TIME = 10 * 60 * 1000;
 const DEFAULT_SEAT_PRICE = 300; // RS
@@ -9,18 +15,24 @@ const DEFAULT_SEAT_PRICE = 300; // RS
 // Cleanup expired locks periodically
 setInterval(async () => {
   try {
-    // Check if SeatLock collection has any documents
-    const lockCount = await SeatLock.countDocuments();
+    const { SeatLock } = getModels();
+    
+    // Check if SeatLock table has any documents
+    const lockCount = await SeatLock.count();
     if (lockCount === 0) {
       console.log('No seat locks to cleanup');
       return;
     }
 
     const now = new Date();
-    const result = await SeatLock.deleteMany({ expiresAt: { $lt: now } });
+    const result = await SeatLock.destroy({
+      where: {
+        expiresAt: { [Op.lt]: now }
+      }
+    });
     
-    if (result.deletedCount > 0) {
-      console.log(`${result.deletedCount} expired seat locks cleaned up`);
+    if (result > 0) {
+      console.log(`${result} expired seat locks cleaned up`);
     } else {
       console.log('No expired seat locks found');
     }
@@ -31,29 +43,40 @@ setInterval(async () => {
 
 
 async function holdSeats(eventId, seats, eventDate, duration) {
+  const { SeatLock, Booking } = getModels();
   const now = new Date();
-  const bookedSeats = await Booking.find({
-    eventId,
-    seats: { $in: seats },
-    status: 'CONFIRMED',
-    paymentStatus: 'COMPLETED'
+  
+  // Check if seats are already booked with confirmed payment
+  const bookedSeats = await Booking.findAll({
+    where: {
+      eventId,
+      status: 'CONFIRMED',
+      paymentStatus: 'COMPLETED'
+    }
   });
 
-  if (bookedSeats.length > 0) {
-    throw new Error('One or more seats are already booked');
-  }
-
+  // Flatten the seats from bookings
+  const bookedSeatIds = bookedSeats.flatMap(b => JSON.parse(JSON.stringify(b.seats)));
+  
   for (const seat of seats) {
+    if (bookedSeatIds.includes(seat)) {
+      throw new Error('One or more seats are already booked');
+    }
+
     const existingLock = await SeatLock.findOne({
-      eventId,
-      seatId: seat,
-      expiresAt: { $gt: now }
+      where: {
+        eventId,
+        seatId: seat,
+        expiresAt: { [Op.gt]: now }
+      }
     });
 
     if (existingLock) {
       throw new Error(`Seat ${seat} is temporarily locked`);
     }
   }
+
+  // Create locks for all seats
   const locks = seats.map(seat => ({
     eventId,
     seatId: seat,
@@ -62,29 +85,42 @@ async function holdSeats(eventId, seats, eventDate, duration) {
     expiresAt: new Date(Date.now() + 10 * 60 * 1000)
   }));
 
-  await SeatLock.insertMany(locks);
+  await SeatLock.bulkCreate(locks);
 }
 
 async function confirmBooking(eventId, seats, userId, eventDate, duration) {
+  const { SeatLock, Booking, Price } = getModels();
   const now = new Date();
 
   // Check if any seats are already booked
-  const bookedSeats = await Booking.find({
-    eventId,
-    seats: { $in: seats },
-    status: 'CONFIRMED',
-    paymentStatus: 'COMPLETED'
+  const bookedSeats = await Booking.findAll({
+    where: {
+      eventId,
+      status: 'CONFIRMED',
+      paymentStatus: 'COMPLETED'
+    }
   });
 
-  if (bookedSeats.length > 0) {
-    throw new Error('One or more seats are already booked');
+  const bookedSeatIds = bookedSeats.flatMap(b => JSON.parse(JSON.stringify(b.seats)));
+  for (const seat of seats) {
+    if (bookedSeatIds.includes(seat)) {
+      throw new Error('One or more seats are already booked');
+    }
   }
 
-  const locks = await SeatLock.find({ eventId, seatId: { $in: seats }, expiresAt: { $gt: now } });
+  // Check if seat locks exist and are valid
+  const locks = await SeatLock.findAll({
+    where: {
+      eventId,
+      seatId: { [Op.in]: seats },
+      expiresAt: { [Op.gt]: now }
+    }
+  });
+
   if (locks.length !== seats.length) throw new Error('Seat lock expired');
 
   // Get seat price
-  let priceInfo = await Price.findOne({ eventId });
+  let priceInfo = await Price.findOne({ where: { eventId } });
   const seatPrice = priceInfo ? priceInfo.seatPrice : DEFAULT_SEAT_PRICE;
   const totalPrice = seats.length * seatPrice;
 
@@ -102,10 +138,15 @@ async function confirmBooking(eventId, seats, userId, eventDate, duration) {
   });
 
   // Remove seat locks until payment is confirmed
-  await SeatLock.deleteMany({ eventId, seatId: { $in: seats } });
+  await SeatLock.destroy({
+    where: {
+      eventId,
+      seatId: { [Op.in]: seats }
+    }
+  });
 
   return {
-    bookingId: booking._id,
+    bookingId: booking.id,
     message: 'Booking created. Payment required to confirm seats.',
     seats,
     seatPrice,
@@ -118,11 +159,13 @@ async function confirmBooking(eventId, seats, userId, eventDate, duration) {
 
 // Process payment for a booking
 async function processPayment(bookingId, paymentId, eventDate, duration) {
+  const { SeatLock, Booking } = getModels();
+  
   if (!bookingId || !paymentId) {
     throw new Error('Booking ID and Payment ID are required');
   }
 
-  const booking = await Booking.findById(bookingId);
+  const booking = await Booking.findByPk(bookingId);
   if (!booking) {
     throw new Error('Booking not found');
   }
@@ -131,15 +174,14 @@ async function processPayment(bookingId, paymentId, eventDate, duration) {
     throw new Error('Payment already completed for this booking');
   }
 
-  // Simulate payment processing (in real scenario, integrate with payment gateway)
-  // For now, we'll mark payment as completed
+  // Update payment status to COMPLETED
   booking.paymentStatus = 'COMPLETED';
   booking.paymentId = paymentId;
   booking.paymentDate = new Date();
   booking.status = 'CONFIRMED';
   await booking.save();
 
-  // Hold the seats
+  // Create locks for booked seats
   const locks = booking.seats.map(seat => ({
     eventId: booking.eventId,
     seatId: seat,
@@ -147,11 +189,11 @@ async function processPayment(bookingId, paymentId, eventDate, duration) {
     duration: booking.duration,
     expiresAt: new Date(Date.now() + 10 * 60 * 1000)
   }));
-  await SeatLock.insertMany(locks);
+  await SeatLock.bulkCreate(locks);
 
   return {
     message: 'Payment processed successfully. Seats are now confirmed.',
-    bookingId: booking._id,
+    bookingId: booking.id,
     paymentStatus: 'COMPLETED',
     paymentId,
     paymentDate: booking.paymentDate,
@@ -163,13 +205,15 @@ async function processPayment(bookingId, paymentId, eventDate, duration) {
 
 // Get booking payment details
 async function getBookingPaymentDetails(bookingId) {
-  const booking = await Booking.findById(bookingId);
+  const { Booking } = getModels();
+  
+  const booking = await Booking.findByPk(bookingId);
   if (!booking) {
     throw new Error('Booking not found');
   }
 
   return {
-    bookingId: booking._id,
+    bookingId: booking.id,
     seats: booking.seats,
     seatPrice: booking.seatPrice,
     totalPrice: booking.totalPrice,
@@ -182,11 +226,13 @@ async function getBookingPaymentDetails(bookingId) {
 
 // Set seat price for an event
 async function setSeatPrice(eventId, seatPrice) {
+  const { Price } = getModels();
+  
   if (!eventId || !seatPrice || seatPrice <= 0) {
     throw new Error('Event ID and valid seat price are required');
   }
 
-  let priceInfo = await Price.findOne({ eventId });
+  let priceInfo = await Price.findOne({ where: { eventId } });
   if (priceInfo) {
     priceInfo.seatPrice = seatPrice;
     priceInfo.updatedAt = new Date();
@@ -208,6 +254,8 @@ async function setSeatPrice(eventId, seatPrice) {
 
 // Create a new event
 async function createEvent(name, city, date, duration, seats = []) {
+  const { Event } = getModels();
+  
   if (!name || !date || !duration) {
     throw new Error('Event name, date and duration are required');
   }
@@ -225,11 +273,13 @@ async function createEvent(name, city, date, duration, seats = []) {
 
 // Get all available seats for an event
 async function getAvailableSeats(eventId) {
+  const { Event, Booking, SeatLock } = getModels();
+  
   if (!eventId) {
     throw new Error('Event ID is required');
   }
 
-  const event = await Event.findById(eventId);
+  const event = await Event.findByPk(eventId);
   if (!event) {
     throw new Error('Event not found');
   }
@@ -237,20 +287,26 @@ async function getAvailableSeats(eventId) {
   const now = new Date();
 
   // Find all confirmed booked seats
-  const bookedSeats = await Booking.find({
-    eventId,
-    status: 'CONFIRMED',
-    paymentStatus: 'COMPLETED'
-  }, { seats: 1 });
+  const bookedSeats = await Booking.findAll({
+    where: {
+      eventId,
+      status: 'CONFIRMED',
+      paymentStatus: 'COMPLETED'
+    },
+    attributes: ['seats']
+  });
 
   // Find all temporarily locked seats
-  const lockedSeats = await SeatLock.find({
-    eventId,
-    expiresAt: { $gt: now }
-  }, { seatId: 1 });
+  const lockedSeats = await SeatLock.findAll({
+    where: {
+      eventId,
+      expiresAt: { [Op.gt]: now }
+    },
+    attributes: ['seatId']
+  });
 
   // Flatten booked seats array
-  const bookedSeatIds = bookedSeats.flatMap(booking => booking.seats);
+  const bookedSeatIds = bookedSeats.flatMap(booking => JSON.parse(JSON.stringify(booking.seats)));
 
   // Flatten locked seat IDs
   const lockedSeatIds = lockedSeats.map(lock => lock.seatId);
@@ -276,6 +332,8 @@ async function getAvailableSeats(eventId) {
 
 // Insert new seats for an event
 async function insertSeats(eventId, seatList, eventDate, duration) {
+  const { Event } = getModels();
+  
   if (!Array.isArray(seatList) || seatList.length === 0) {
     throw new Error('Seats must be a non-empty array');
   }
@@ -285,15 +343,16 @@ async function insertSeats(eventId, seatList, eventDate, duration) {
   }
 
   // Check if event exists and update with seats if needed
-  const event = await Event.findById(eventId);
+  const event = await Event.findByPk(eventId);
   if (!event) {
     throw new Error('Event not found');
   }
 
   // Add new seats to the event if not already present
-  const newSeats = seatList.filter(seat => !event.seats.includes(seat));
+  const currentSeats = event.seats || [];
+  const newSeats = seatList.filter(seat => !currentSeats.includes(seat));
   if (newSeats.length > 0) {
-    event.seats = [...event.seats, ...newSeats];
+    event.seats = [...currentSeats, ...newSeats];
     event.date = eventDate;
     event.duration = duration;
     await event.save();
@@ -309,11 +368,13 @@ async function insertSeats(eventId, seatList, eventDate, duration) {
 
 // Cancel a booking
 async function cancelBooking(bookingId, eventDate, duration) {
+  const { Booking, SeatLock } = getModels();
+  
   if (!bookingId || !eventDate || !duration) {
     throw new Error('Booking ID, event date, and duration are required');
   }
 
-  const booking = await Booking.findById(bookingId);
+  const booking = await Booking.findByPk(bookingId);
   if (!booking) {
     throw new Error('Booking not found');
   }
@@ -328,14 +389,16 @@ async function cancelBooking(bookingId, eventDate, duration) {
   await booking.save();
 
   // Remove seat locks for cancelled booking
-  await SeatLock.deleteMany({
-    eventId: booking.eventId,
-    seatId: { $in: booking.seats }
+  await SeatLock.destroy({
+    where: {
+      eventId: booking.eventId,
+      seatId: { [Op.in]: booking.seats }
+    }
   });
 
   return {
     message: 'Booking cancelled successfully',
-    bookingId: booking._id,
+    bookingId: booking.id,
     canceledSeats: booking.seats,
     eventDate,
     duration,

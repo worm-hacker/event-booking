@@ -1,19 +1,75 @@
-const mongoose = require('mongoose');
+const { DataTypes } = require('sequelize');
 
-const BookingSchema = new mongoose.Schema({
-  eventId: String,
-  userId: String,
-  seats: [String],
-  status: String,
-  eventDate: { type: Date, required: true },
-  duration: { type: Number, required: true },
-  totalPrice: { type: Number, required: true },
-  seatPrice: { type: Number, required: true },
-  paymentStatus: { type: String, enum: ['PENDING', 'COMPLETED', 'FAILED'], default: 'PENDING' },
-  paymentId: { type: String, default: null },
-  paymentDate: { type: Date, default: null },
-  createdAt: { type: Date, default: Date.now },
-  canceledAt: { type: Date, default: null }
-});
+module.exports = (sequelize) => {
+  const Booking = sequelize.define('Booking', {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true
+    },
+    eventId: {
+      type: DataTypes.STRING(9),
+      allowNull: false,
+      index: true
+    },
+    userId: {
+      type: DataTypes.STRING(255),
+      allowNull: false,
+      index: true
+    },
+    seats: {
+      type: DataTypes.JSON,
+      allowNull: false,
+      comment: 'Array of booked seat IDs'
+    },
+    status: {
+      type: DataTypes.ENUM('PENDING', 'CONFIRMED', 'CANCELLED'),
+      defaultValue: 'PENDING',
+      index: true
+    },
+    eventDate: {
+      type: DataTypes.DATE,
+      allowNull: false
+    },
+    duration: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      comment: 'Duration in minutes'
+    },
+    totalPrice: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: false
+    },
+    seatPrice: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: false
+    },
+    paymentStatus: {
+      type: DataTypes.ENUM('PENDING', 'COMPLETED', 'FAILED'),
+      defaultValue: 'PENDING',
+      index: true
+    },
+    paymentId: {
+      type: DataTypes.STRING(255),
+      allowNull: true,
+      unique: true
+    },
+    paymentDate: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    createdAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW
+    },
+    canceledAt: {
+      type: DataTypes.DATE,
+      allowNull: true
+    }
+  }, {
+    tableName: 'bookings',
+    timestamps: false
+  });
 
-module.exports = mongoose.model('Booking', BookingSchema);
+  return Booking;
+};

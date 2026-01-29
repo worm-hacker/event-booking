@@ -1,540 +1,720 @@
-# Event Booking System - Complete Documentation
+# Event Booking System - System Design & Architecture
 
-## Document Information
-- **Project Name:** Event Booking System
-- **Version:** 1.0
-- **Date:** January 29, 2026
-- **Author:** Development Team
+**Version:** 1.0 | **Date:** January 29, 2026 | **Status:** Production Ready
 
 ---
 
-## Table of Contents
-1. [Introduction](#introduction)
-2. [High Level Design (HLD)](#high-level-design-hld)
-3. [Low Level Design (LLD)](#low-level-design-lld)
-4. [System Architecture](#system-architecture)
-5. [Database Schema](#database-schema)
-6. [API Documentation](#api-documentation)
-7. [Data Flow Diagrams](#data-flow-diagrams)
-8. [Technology Stack](#technology-stack)
+## 1. HIGH-LEVEL DESIGN (HLD)
+
+### System Architecture
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ CLIENT LAYER (Web/Mobile Application)                               │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ REST API Calls
+┌────────────────────────────▼────────────────────────────────────────┐
+│ API GATEWAY & LOAD BALANCER (Nginx/HAProxy)                         │
+│ ├─ Route requests to available servers                              │
+│ ├─ SSL/TLS termination                                              │
+│ └─ Rate limiting & DDoS protection                                  │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │
+        ┌────────┬───────────┴───────────┬────────┐
+        │        │                       │        │
+┌───────▼──┐ ┌──▼────────┐ ┌──────────▼─┐ ┌────▼───┐
+│ Server 1 │ │ Server 2  │ │ Server 3   │ │Server N│
+│ Node.js  │ │ Node.js   │ │ Node.js    │ │Node.js │
+└────┬─────┘ └─────┬─────┘ └─────┬──────┘ └────┬───┘
+     │             │              │            │
+     └─────────────┼──────────────┼────────────┘
+                   │              │
+     ┌─────────────┼──────────────┼────────────┐
+     │             │              │            │
+┌────▼──────────┐  │   ┌──────────▼────┐      │
+│ Redis Cache   │  │   │ MySQL Master  │      │
+│ (Distributed) │  │   │ (Write)       │      │
+└───────────────┘  │   └───┬───────────┘      │
+                   │       │                  │
+                   │   ┌───▼──────────────┐   │
+                   │   │ MySQL Replicas   │   │
+                   │   │ (Read-only)      │   │
+                   │   └──────────────────┘   │
+                   │                         │
+              ┌────▼────────────────────┐   │
+              │ Background Jobs         │   │
+              │ - Seat lock cleanup     │───┘
+              │ - Notifications         │
+              └────────────────────────┘
+```
+
+### System Components
+
+| Component | Role | Technology |
+|-----------|------|-----------|
+| **Client** | Web/Mobile app | React/Vue/Native |
+| **API Gateway** | Request routing | Nginx/HAProxy |
+| **Server Layer** | Business logic | Node.js + Express |
+| **Cache Layer** | Performance | Redis |
+| **DB Master** | Write operations | MySQL 5.7+ |
+| **DB Replicas** | Read operations | MySQL (slave) |
+| **Background Jobs** | Async tasks | Node.js Timer |
 
 ---
 
-## Introduction
+## 2. LOW-LEVEL DESIGN (LLD)
 
-The Event Booking System is a comprehensive seat booking platform that handles:
-- Event management with date and duration tracking
-- Seat management and inventory
-- Real-time seat locking mechanism
-- Payment processing for bookings
-- Booking confirmation and cancellation
-- Price management per event
+### Request Processing Flow
+```
+REQUEST
+  ├─ Validation Layer
+  │  ├─ Input validation
+  │  ├─ Type checking
+  │  └─ Permission verification
+  │
+  ├─ Service Layer (Business Logic)
+  │  ├─ BookingService
+  │  ├─ PaymentService
+  │  ├─ PriceService
+  │  └─ SeatLockService
+  │
+  ├─ Cache Layer
+  │  ├─ Check Redis cache
+  │  ├─ If miss: Query database
+  │  └─ Update cache with TTL
+  │
+  ├─ Data Access Layer
+  │  ├─ Sequelize ORM
+  │  ├─ SQL query execution
+  │  └─ Connection pooling
+  │
+  └─ Response Layer
+     ├─ Format response
+     ├─ Set status code
+     └─ Send to client
+```
 
-**Key Features:**
-- Temporary seat holds (10 minutes)
-- Two-step booking process (Confirm + Payment)
-- Payment status tracking
-- Seat price management (default: RS 300)
-- Booking cancellation with refunds
-- Automatic seat lock expiration
+### Core Services
+
+#### BookingService
+```
+holdSeats(eventId, seats, eventDate, duration)
+  → Create temporary 10-minute seat locks
+  → Return lock confirmation
+
+confirmBooking(eventId, seats, userId, eventDate, duration)
+  → Verify seat availability
+  → Fetch price (from cache if available)
+  → Calculate totalPrice = seats.count × seatPrice
+  → Create booking (status: PENDING)
+  → Remove temporary locks
+  → Cache invalidation
+  → Return bookingId + price
+
+processPayment(bookingId, paymentId, eventDate, duration)
+  → Validate booking exists
+  → Check if already paid
+  → Update paymentStatus = COMPLETED
+  → Create permanent seat locks
+  → Update booking status = CONFIRMED
+  → Cache invalidation
+  → Return confirmation
+
+cancelBooking(bookingId, eventDate, duration)
+  → Check if cancellation allowed
+  → Calculate refund (full if paid, 0 if pending)
+  → Update status = CANCELLED
+  → Remove all seat locks
+  → Cache invalidation
+  → Return refund details
+```
+
+#### PriceService
+```
+setSeatPrice(eventId, seatPrice)
+  → Validate inputs
+  → Create/update price record
+  → Invalidate price cache
+  → Return confirmation
+
+getSeatPrice(eventId) [WITH CACHING]
+  → Check Redis cache (key: "price:{eventId}")
+  → If miss: Query database
+  → Cache for 10 minutes
+  → Return seatPrice
+```
+
+#### SeatLockService
+```
+cleanupExpiredLocks() [Background Job - Every 60 sec]
+  → Find all locks where expiresAt < NOW()
+  → Delete expired locks
+  → Invalidate affected caches
+  → Log: "X locks cleaned"
+
+createLock(eventId, seatId, expiresAt)
+  → Create seat lock record
+  → Set expiry: now + 10 minutes
+  → Update seat availability cache
+  → Return lock details
+```
 
 ---
 
-## High Level Design (HLD)
+## 3. SYSTEM DESIGN & ARCHITECTURE
 
-### 1. System Components
-
+### Technology Stack
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     CLIENT APPLICATION                      │
-│                    (Web/Mobile Frontend)                    │
-└────────────┬──────────────────────────────────────────────┘
-             │
-             │ HTTP/REST API Calls
-             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                     API GATEWAY / ROUTER                    │
-│              (Express.js Routing Layer)                     │
-└────────────┬──────────────────────────────────────────────┘
-             │
-             │ Routes Requests
-             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   SERVICE LAYER                             │
-│    ┌──────────────┬──────────────┬──────────────┐           │
-│    │   Booking    │   Payment    │    Seat      │           │
-│    │  Service     │   Service    │  Management  │           │
-│    └──────────────┴──────────────┴──────────────┘           │
-└────────────┬──────────────────────────────────────────────┘
-             │
-             │ Data Operations
-             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   DATA ACCESS LAYER                         │
-│    ┌──────────────┬──────────────┬──────────────┐           │
-│    │  Booking     │   Price      │   SeatLock   │           │
-│    │  Repository  │  Repository  │  Repository  │           │
-│    └──────────────┴──────────────┴──────────────┘           │
-└────────────┬──────────────────────────────────────────────┘
-             │
-             │ CRUD Operations
-             ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   DATABASE LAYER                            │
-│                  (MongoDB/Mongoose)                         │
-│    ┌──────────────┬──────────────┬──────────────┐           │
-│    │  Events      │   Bookings   │   SeatLocks  │           │
-│    │  Collection  │  Collection  │  Collection  │           │
-│    └──────────────┴──────────────┴──────────────┘           │
-└─────────────────────────────────────────────────────────────┘
+Frontend:        React/Angular/Mobile App(Fluter/Ionic)
+API Layer:       Express.js (Node.js)
+ORM:             Sequelize
+Database:        MySQL 5.7+ (Master-Slave)
+Cache:           Redis (Distributed)
+Load Balancer:   Nginx/HAProxy
+Message Queue:   RabbitMQ/Kafka (Future)
+Monitoring:      Prometheus + Grafana
 ```
 
-### 2. Key Modules
-
-| Module | Responsibility |
-|--------|-----------------|
-| **Event Management** | Create, read, update events with date, duration, and seats |
-| **Booking Management** | Create bookings, track status, manage payment lifecycle |
-| **Seat Locking** | Temporary seat reservation, automatic expiration (10 min) |
-| **Payment Processing** | Validate payments, update booking status, calculate refunds |
-| **Price Management** | Set and retrieve seat prices per event |
-
-### 3. Core Features
-
-#### Feature 1: Seat Holding
-- User can hold seats for 10 minutes without payment
-- Automatic expiration of holds after 10 minutes
-- Prevents overselling
-
-#### Feature 2: Two-Step Booking
-1. **Confirm Booking** - Reserve seats with pending payment
-2. **Process Payment** - Complete payment and lock seats
-
-#### Feature 3: Payment Integration
-- Track payment status (PENDING, COMPLETED, FAILED)
-- Calculate total price (seats × seat price)
-- Process refunds on cancellation
-
-#### Feature 4: Seat Management
-- Insert new seats per event
-- Track seat availability
-- Prevent double booking
+### Design Patterns
+| Pattern | Implementation |
+|---------|-----------------|
+| Service Layer | Business logic separation |
+| Repository | Sequelize Models |
+| Cache-Aside | Redis for frequently accessed data |
+| Async Jobs | Background cleanup tasks |
+| Connection Pool | Manage DB connections |
+| Circuit Breaker | Payment gateway fallback |
 
 ---
 
-## Low Level Design (LLD)
+## 4. SCALABILITY ARCHITECTURE
 
-### 1. Module Breakdown
-
-#### A. Booking Service Module
-
+### Horizontal Scaling
 ```
-BookingService {
-  
-  async holdSeats(eventId, seats, eventDate, duration)
-    - Validate seat availability
-    - Check for existing locks
-    - Create temporary seat locks
-    - Return success message
-  
-  async confirmBooking(eventId, seats, userId, eventDate, duration)
-    - Verify seat availability
-    - Fetch seat price from Price collection
-    - Calculate total price (seats × seatPrice)
-    - Create booking with PENDING payment status
-    - Remove temporary seat locks
-    - Return booking details with price info
-  
-  async processPayment(bookingId, paymentId, eventDate, duration)
-    - Validate booking exists
-    - Update payment status to COMPLETED
-    - Store payment ID and date
-    - Create seat locks for booked seats
-    - Return confirmation with locked seats
-  
-  async getBookingPaymentDetails(bookingId)
-    - Retrieve booking information
-    - Return payment status and price breakdown
-  
-  async insertSeats(eventId, seatList, eventDate, duration)
-    - Validate event exists
-    - Add new seats to event
-    - Update event date and duration
-    - Return confirmation with total seats
-  
-  async cancelBooking(bookingId, eventDate, duration)
-    - Verify booking exists and not already cancelled
-    - Update status to CANCELLED
-    - Store cancellation timestamp
-    - Remove seat locks
-    - Calculate refund amount
-    - Return cancellation details
-}
+Load Balancer (Nginx)
+├─ Node Server 1:3001
+├─ Node Server 2:3002
+├─ Node Server 3:3003
+└─ Node Server N:300N
+
+Shared Resources:
+├─ MySQL Master (single write)
+├─ MySQL Replicas (multiple read)
+├─ Redis Cluster (distributed cache)
+└─ Shared config storage
 ```
 
-#### B. Price Service Module
-
+### Database Scaling
 ```
-PriceService {
-  
-  async setSeatPrice(eventId, seatPrice)
-    - Validate inputs
-    - Create or update price record
-    - Store event ID and seat price
-    - Return confirmation
-  
-  async getSeatPrice(eventId)
-    - Fetch price from Price collection
-    - Return seat price or default (RS 300)
-}
+WRITE PATH:
+Client → Load Balancer → Any Server → Master DB → Replicas
+
+READ PATH:
+Client → Load Balancer → Any Server → Read Replica → Cache
+
+Connection Pool Config:
+├─ Min: 10 connections
+├─ Max: 20 connections
+├─ Idle timeout: 10s
+└─ Validation: 30s interval
 ```
 
-#### C. Seat Lock Manager
-
+### Caching Tiers
 ```
-SeatLockManager {
-  
-  // Runs every 60 seconds
-  async cleanupExpiredLocks()
-    - Find all locks with expiresAt < now
-    - Delete expired locks
-    - Log cleanup results
-  
-  async createLock(eventId, seatId, eventDate, duration)
-    - Create lock with 10-minute expiration
-    - Store event details
-  
-  async releaseLock(eventId, seatId)
-    - Delete lock for seat
-    - Make seat available again
-}
+Level 1: Application Memory (Config)
+├─ Constants (24h TTL)
+└─ Settings (1h TTL)
+
+Level 2: Redis Distributed Cache
+├─ Event details (5 min TTL)
+├─ Seat prices (10 min TTL)
+├─ Seat availability (30 sec TTL)
+└─ User sessions (session duration)
+
+Invalidation Strategy:
+├─ On event update → Clear event cache
+├─ On price change → Clear price + availability
+├─ On booking → Clear availability cache
+└─ On payment → Clear booking cache
 ```
 
-### 2. Data Models
+### Future: Database Sharding
+```
+Partition Strategy: By eventId
+├─ Shard 1: eventId 1-1000
+├─ Shard 2: eventId 1001-2000
+└─ Shard N: eventId 2001+
 
-#### Event Schema
-```javascript
+Benefits:
+├─ Distributed load
+├─ Reduced lock contention
+├─ Independent scaling
+├─ Horizontal growth
+```
+
+---
+
+## 5. PERFORMANCE OPTIMIZATION
+
+### Database Performance
+```
+Indexing Strategy:
+├─ bookings.eventId (Regular) → Fast event lookups
+├─ bookings.userId (Regular) → User's bookings
+├─ bookings.paymentStatus (Regular) → Payment filter
+├─ bookings.paymentId (Unique) → Prevent duplicates
+├─ seatlocksqls(eventId, seatId) (Composite) → Lock lookup
+├─ seatlocksqls.expiresAt (Regular) → Cleanup efficiency
+├─ prices.eventId (Unique) → One price per event
+├─ events.date (Regular) → Event date filter
+└─ events.city (Regular) → City-based search
+
+Query Optimization:
+├─ No SELECT * (select specific columns)
+├─ Connection pooling (reuse connections)
+├─ Prepared statements (prevent SQL injection)
+├─ Batch operations (bulk inserts)
+├─ Use read replicas for non-critical queries
+└─ Pagination for large datasets
+```
+
+### API Performance Targets
+```
+API Response Times:
+├─ Hold Seats: < 100ms
+├─ Confirm Booking: < 200ms
+├─ Process Payment: < 500ms
+├─ Get Availability: < 50ms (cached)
+
+Optimization Techniques:
+├─ Async/await (non-blocking)
+├─ Response compression (gzip)
+├─ HTTP caching headers
+├─ CDN for static assets
+├─ Database query optimization
+└─ Connection reuse
+```
+
+### Monitoring Metrics
+```
+Key Metrics to Track:
+├─ API response time (p50, p95, p99)
+├─ Database query latency
+├─ Cache hit ratio (target > 80%)
+├─ Throughput (req/sec)
+├─ Error rate (target < 0.1%)
+├─ Memory usage
+├─ CPU utilization
+└─ Seat lock contention rate
+
+Monitoring Tools:
+├─ Application: New Relic/Datadog
+├─ Database: MySQL slow query log
+├─ Cache: Redis INFO command
+├─ Infrastructure: Prometheus + Grafana
+└─ Logs: ELK Stack
+```
+
+---
+
+## 6. DATABASE SCHEMA
+
+### Core Tables
+
+```sql
+-- Events Table
+events (
+  id VARCHAR(9) PRIMARY KEY,          -- Auto-generated alphanumeric
+  name VARCHAR(255) NOT NULL,
+  city VARCHAR(255),
+  date DATETIME NOT NULL,
+  duration INT NOT NULL,              -- In minutes
+  seats JSON NOT NULL,                -- ["A1", "A2", "B1", ...]
+  createdAt DATETIME DEFAULT NOW()
+)
+KEY: idx_date, idx_city
+
+-- Bookings Table  
+bookings (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  eventId VARCHAR(9) NOT NULL,        -- FK to events
+  userId VARCHAR(255) NOT NULL,
+  seats JSON NOT NULL,
+  status ENUM(...) DEFAULT 'PENDING', -- PENDING, CONFIRMED, CANCELLED
+  eventDate DATETIME NOT NULL,
+  duration INT NOT NULL,
+  totalPrice DECIMAL(10,2),
+  seatPrice DECIMAL(10,2),
+  paymentStatus ENUM(...) DEFAULT 'PENDING', -- PENDING, COMPLETED, FAILED
+  paymentId VARCHAR(255) UNIQUE,
+  paymentDate DATETIME,
+  canceledAt DATETIME,
+  createdAt DATETIME,
+  updatedAt DATETIME
+)
+KEYS: idx_eventId, idx_userId, idx_paymentStatus, idx_paymentId
+
+-- Seat Locks Table
+seatlocksqls (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  eventId VARCHAR(9) NOT NULL,        -- FK to events
+  seatId VARCHAR(255) NOT NULL,
+  eventDate DATETIME NOT NULL,
+  duration INT NOT NULL,
+  expiresAt DATETIME NOT NULL,        -- Cleanup after 10 min
+  createdAt DATETIME
+)
+KEYS: idx_eventId_seatId, idx_expiresAt
+
+-- Prices Table
+prices (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  eventId VARCHAR(9) UNIQUE NOT NULL, -- FK to events
+  seatPrice DECIMAL(10,2) DEFAULT 300,
+  currency VARCHAR(10) DEFAULT 'RS',
+  createdAt DATETIME,
+  updatedAt DATETIME
+)
+KEY: idx_eventId
+```
+
+---
+
+## 7. COMPLETE API DOCUMENTATION
+
+### 1. Create Event
+```
+POST /api/bookings/event
+Content-Type: application/json
+
+PAYLOAD:
 {
-  _id: ObjectId,
-  name: String,
-  city: String,
-  date: Date (required),
-  duration: Number (minutes, required),
-  seats: [String],
-  createdAt: Date
+  "name": "Tech Conf 2026",
+  "city": "Mumbai",
+  "date": "2026-02-15T10:00:00Z",
+  "duration": 120,
+  "seats": ["A1", "A2", "A3", "B1", "B2"]
 }
-```
 
-#### Booking Schema
-```javascript
+RESPONSE (200):
 {
-  _id: ObjectId,
-  eventId: String,
-  userId: String,
-  seats: [String],
-  status: String (PENDING, CONFIRMED, CANCELLED),
-  eventDate: Date (required),
-  duration: Number (required),
-  totalPrice: Number (required),
-  seatPrice: Number (required),
-  paymentStatus: String (PENDING, COMPLETED, FAILED),
-  paymentId: String,
-  paymentDate: Date,
-  createdAt: Date,
-  canceledAt: Date
+  "id": "ABC123XYZ",
+  "name": "Tech Conf 2026",
+  "city": "Mumbai",
+  "date": "2026-02-15T10:00:00Z",
+  "duration": 120,
+  "seats": ["A1", "A2", "A3", "B1", "B2"],
+  "createdAt": "2026-01-29T12:00:00Z"
 }
 ```
 
-#### SeatLock Schema
-```javascript
+### 2. Hold Seats (10 min)
+```
+POST /api/bookings/hold
+Content-Type: application/json
+
+PAYLOAD:
 {
-  _id: ObjectId,
-  eventId: String,
-  seatId: String,
-  eventDate: Date (required),
-  duration: Number (required),
-  expiresAt: Date (TTL index: 600 seconds)
+  "eventId": "ABC123XYZ",
+  "seats": ["A1", "A2"],
+  "eventDate": "2026-02-15T10:00:00Z",
+  "duration": 120
 }
-```
 
-#### Price Schema
-```javascript
+RESPONSE (200):
 {
-  _id: ObjectId,
-  eventId: String (required),
-  seatPrice: Number (required, default: 300),
-  currency: String (default: 'RS'),
-  createdAt: Date,
-  updatedAt: Date
+  "message": "Seats held for 10 minutes",
+  "expiresAt": "2026-01-29T12:10:00Z"
+}
+
+ERROR (400):
+{"error": "One or more seats are already booked"}
+```
+
+### 3. Confirm Booking
+```
+POST /api/bookings/confirm
+Content-Type: application/json
+
+PAYLOAD:
+{
+  "eventId": "ABC123XYZ",
+  "seats": ["A1", "A2"],
+  "userId": "user456",
+  "eventDate": "2026-02-15T10:00:00Z",
+  "duration": 120
+}
+
+RESPONSE (200):
+{
+  "bookingId": 1,
+  "message": "Booking created. Payment required.",
+  "seats": ["A1", "A2"],
+  "seatPrice": 300,
+  "totalPrice": 600,
+  "paymentStatus": "PENDING"
 }
 ```
 
-### 3. Key Algorithms
-
-#### Algorithm 1: Seat Availability Check
+### 4. Process Payment
 ```
-Function: CheckSeatAvailability(eventId, seatIds)
-Input: eventId, list of seatIds
-Output: Boolean (true if all seats available)
+POST /api/bookings/payment/process
+Content-Type: application/json
 
-1. Query Booking collection for confirmed bookings
-   - Filter: {eventId, seats: {$in: seatIds}, paymentStatus: 'COMPLETED'}
-2. If any records found, return FALSE
-3. Query SeatLock collection for active locks
-   - Filter: {eventId, seatId: {$in: seatIds}, expiresAt: {$gt: now}}
-4. If any records found, return FALSE
-5. Return TRUE
-```
+PAYLOAD:
+{
+  "bookingId": 1,
+  "paymentId": "PAY_TXN_2026_001_ABC",
+  "eventDate": "2026-02-15T10:00:00Z",
+  "duration": 120
+}
 
-#### Algorithm 2: Calculate Total Price
-```
-Function: CalculateTotalPrice(seatCount, seatPrice)
-Input: Number of seats, price per seat
-Output: Total price
-
-1. Fetch seat price from Price collection by eventId
-2. If not found, use DEFAULT_SEAT_PRICE = 300
-3. totalPrice = seatCount × seatPrice
-4. Return totalPrice
+RESPONSE (200):
+{
+  "message": "Payment processed successfully.",
+  "bookingId": 1,
+  "paymentStatus": "COMPLETED",
+  "status": "CONFIRMED",
+  "seats": ["A1", "A2"],
+  "totalPrice": 600
+}
 ```
 
-#### Algorithm 3: Automatic Lock Cleanup
+### 5. Get Payment Details
 ```
-Function: CleanupExpiredLocks() [Runs every 60 seconds]
-Input: None
-Output: Number of locks deleted
+GET /api/bookings/payment/details/:bookingId
 
-1. Get current timestamp: now = Date.now()
-2. Query SeatLock: {expiresAt: {$lt: now}}
-3. Delete all matching documents
-4. Log: "X expired locks cleaned up"
-5. Return count of deleted locks
+RESPONSE (200):
+{
+  "bookingId": 1,
+  "seats": ["A1", "A2"],
+  "seatPrice": 300,
+  "totalPrice": 600,
+  "paymentStatus": "COMPLETED",
+  "status": "CONFIRMED",
+  "eventDate": "2026-02-15T10:00:00Z"
+}
+```
+
+### 6. Set Seat Price
+```
+POST /api/bookings/price/set
+Content-Type: application/json
+
+PAYLOAD:
+{
+  "eventId": "ABC123XYZ",
+  "seatPrice": 500
+}
+
+RESPONSE (200):
+{
+  "message": "Seat price updated successfully",
+  "eventId": "ABC123XYZ",
+  "seatPrice": 500,
+  "currency": "RS"
+}
+```
+
+### 7. Insert Seats
+```
+POST /api/bookings/seats/insert
+Content-Type: application/json
+
+PAYLOAD:
+{
+  "eventId": "ABC123XYZ",
+  "seats": ["C1", "C2", "C3"],
+  "eventDate": "2026-02-15T10:00:00Z",
+  "duration": 120
+}
+
+RESPONSE (200):
+{
+  "message": "3 seats inserted successfully",
+  "totalSeats": 8
+}
+```
+
+### 8. Get Available Seats
+```
+GET /api/bookings/seats/available/:eventId
+
+RESPONSE (200):
+{
+  "eventId": "ABC123XYZ",
+  "availableSeats": ["A1", "B1", "C1"],
+  "bookedSeats": ["A2", "B2"],
+  "totalSeats": 5
+}
+```
+
+### 9. Cancel Booking
+```
+POST /api/bookings/cancel
+Content-Type: application/json
+
+PAYLOAD:
+{
+  "bookingId": 1,
+  "eventDate": "2026-02-15T10:00:00Z",
+  "duration": 120
+}
+
+RESPONSE (200):
+{
+  "message": "Booking cancelled successfully",
+  "bookingId": 1,
+  "canceledSeats": ["A1", "A2"],
+  "refundAmount": 600,
+  "canceledAt": "2026-01-29T12:30:00Z"
+}
 ```
 
 ---
 
-## System Architecture
+## 8. ERROR HANDLING & STATUS CODES
 
-### 1. End-to-End Architecture Diagram
+| Code | Meaning | Example |
+|------|---------|---------|
+| 200 | Success | Booking confirmed |
+| 400 | Bad Request | Missing required field |
+| 404 | Not Found | Booking doesn't exist |
+| 409 | Conflict | Seat already booked |
+| 500 | Server Error | Database connection failed |
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                          CLIENT LAYER                            │
-│                  (Web Browser / Mobile App)                      │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │
-                         │ HTTPS/REST
-                         │
-┌────────────────────────▼─────────────────────────────────────────┐
-│                      PRESENTATION LAYER                          │
-│                    (API Endpoints / Routes)                      │
-│  ┌─────────────┬──────────────┬──────────────┬─────────────┐   │
-│  │ /hold       │ /confirm     │ /payment/*   │ /seats/*    │   │
-│  │ /cancel     │ /price/set   │ /price/set   │             │   │
-│  └─────────────┴──────────────┴──────────────┴─────────────┘   │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │
-                         │ Request Processing
-                         │
-┌────────────────────────▼─────────────────────────────────────────┐
-│                     BUSINESS LOGIC LAYER                         │
-│                  (Service Classes & Functions)                   │
-│  ┌──────────────────────────────────────────────────────┐       │
-│  │  BookingService    │  PriceService  │  SeatLockMgr   │       │
-│  │  - holdSeats()     │  - setSeatPrice│  - cleanup()   │       │
-│  │  - confirmBooking()│  - getSeatPrice│  - createLock()│       │
-│  │  - processPayment()│                │  - releaseLock│       │
-│  │  - cancelBooking() │                │                │       │
-│  └──────────────────────────────────────────────────────┘       │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │
-                         │ Data Access
-                         │
-┌────────────────────────▼─────────────────────────────────────────┐
-│                    DATA ACCESS LAYER                             │
-│                 (Mongoose / ORM Models)                          │
-│  ┌─────────────┬──────────────┬──────────────┬─────────────┐   │
-│  │ Event Model │ Booking Model│ SeatLock Mdl │ Price Model │   │
-│  └─────────────┴──────────────┴──────────────┴─────────────┘   │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │
-                         │ Database Queries
-                         │
-┌────────────────────────▼─────────────────────────────────────────┐
-│                    DATABASE LAYER                                │
-│                  (MongoDB Cluster)                               │
-│  ┌─────────────┬──────────────┬──────────────┬─────────────┐   │
-│  │  events     │  bookings    │  seatLocks   │   prices    │   │
-│  │  collection │  collection  │  collection  │ collection  │   │
-│  └─────────────┴──────────────┴──────────────┴─────────────┘   │
-└──────────────────────────────────────────────────────────────────┘
-```
+---
 
-### 2. Request-Response Flow
+## 9. SEAT LOCK LIFECYCLE
 
 ```
-CLIENT REQUEST
-     │
-     ▼
-EXPRESS ROUTER
-  ├─ Validates request format
-  ├─ Extracts parameters
-     │
-     ▼
-SERVICE LAYER
-  ├─ Validates business logic
-  ├─ Performs calculations
-  ├─ Manages transactions
-     │
-     ▼
-DATA ACCESS LAYER
-  ├─ Constructs database queries
-  ├─ Executes CRUD operations
-  ├─ Handles relationships
-     │
-     ▼
-MONGODB
-  ├─ Executes query
-  ├─ Returns data
-     │
-     ▼
-SERVICE LAYER
-  ├─ Processes response
-  ├─ Formats output
-     │
-     ▼
-EXPRESS ROUTER
-  ├─ Sets HTTP status
-  ├─ Sends JSON response
-     │
-     ▼
-CLIENT RESPONSE
-```
+T=0s:     User holds seats
+          → Lock created, expiresAt = now + 600s
 
-### 3. Booking Workflow
+T=0-300s: Lock is active
+          → Other users cannot book same seats
+          → User must confirm booking
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   BOOKING WORKFLOW                              │
-└─────────────────────────────────────────────────────────────────┘
+T=300s:   User confirms booking
+          → Temporary lock removed
+          → Booking created (PENDING payment)
 
-STEP 1: HOLD SEATS
-  Request: POST /booking/hold
-  ├─ User selects seats
-  ├─ System creates temporary locks (10 min)
-  └─ Seats are reserved
+T=500s:   User processes payment
+          → Permanent lock created (no expiry)
+          → Booking status = CONFIRMED
+          → Seat locked for event duration
 
-STEP 2: CONFIRM BOOKING
-  Request: POST /booking/confirm
-  ├─ User provides payment info request
-  ├─ System creates booking (PENDING)
-  ├─ Calculates total price (seats × rate)
-  └─ Returns payment required response
+T=600s:   (If not paid) Automatic cleanup
+          → Expired lock deleted
+          → Seat becomes available
+          → Other users can book
 
-STEP 3: PROCESS PAYMENT
-  Request: POST /booking/payment/process
-  ├─ Payment gateway validates payment
-  ├─ System updates payment status (COMPLETED)
-  ├─ Creates permanent seat locks
-  ├─ Updates booking status (CONFIRMED)
-  └─ Sends confirmation to user
-
-ALTERNATIVE: CANCEL BOOKING
-  Request: POST /booking/cancel
-  ├─ User initiates cancellation
-  ├─ System marks booking as CANCELLED
-  ├─ Removes seat locks
-  ├─ Processes refund
-  └─ Releases seats for other bookings
-```
-
-### 4. Seat Lock Lifecycle
-
-```
-CREATION: User holds seats
-  └─ SeatLock created with expiresAt = now + 10 minutes
-
-DURING HOLD (10 minutes)
-  ├─ Seat is reserved
-  ├─ Other users cannot book
-  └─ User must pay to confirm
-
-AFTER 10 MINUTES
-  ├─ Automatic cleanup service runs
-  ├─ Expired locks are deleted
-  ├─ Seat becomes available again
-  └─ If payment was made, seat is re-locked (permanent)
-
-PERMANENT LOCK (After Payment)
-  ├─ New lock created after payment
-  ├─ No expiration (TTL removed)
-  ├─ Seat remains booked
-  └─ Only released on cancellation
+On Cancel: Lock removed immediately
+           Seat released for others
 ```
 
 ---
 
-## Database Schema
+## 10. QUICK START
 
-### Collections Structure
+### Installation
+```bash
+# 1. Clone & install
+git clone <repo-url>
+npm install
+
+# 2. Configure MySQL
+cp .env.example .env
+# Edit: DB_HOST, DB_USER, DB_PASSWORD, DB_NAME
+
+# 3. Setup database
+npm run migrate
+
+# 4. Start server
+npm start
+```
+
+### Environment Variables
+```
+DB_HOST=localhost
+DB_USER=root
+DB_PASSWORD=your_password
+DB_NAME=event_booking_db
+DB_PORT=3306
+REDIS_URL=redis://localhost:6379
+PORT=3000
+NODE_ENV=development
+```
+
+---
+
+**Last Updated:** January 29, 2026  
+**Architecture Version:** 1.0  
+**Ready for Production:** ✅
+
+### Tables Structure
 
 ```
 DATABASE: event_booking_db
 
 ├─ events
-│  ├─ _id (ObjectId)
-│  ├─ name (String)
-│  ├─ city (String)
-│  ├─ date (Date)
-│  ├─ duration (Number)
-│  ├─ seats (Array of Strings)
-│  └─ createdAt (Date)
+│  ├─ id (VARCHAR(9)) [Primary Key]
+│  ├─ name (VARCHAR(255))
+│  ├─ city (VARCHAR(255))
+│  ├─ date (DATETIME)
+│  ├─ duration (INT)
+│  ├─ seats (JSON)
+│  └─ createdAt (DATETIME)
 │
 ├─ bookings
-│  ├─ _id (ObjectId)
-│  ├─ eventId (String) [Indexed]
-│  ├─ userId (String) [Indexed]
-│  ├─ seats (Array)
-│  ├─ status (String) [Indexed: PENDING, CONFIRMED, CANCELLED]
-│  ├─ eventDate (Date)
-│  ├─ duration (Number)
-│  ├─ totalPrice (Number)
-│  ├─ seatPrice (Number)
-│  ├─ paymentStatus (String) [Indexed: PENDING, COMPLETED, FAILED]
-│  ├─ paymentId (String) [Unique Index]
-│  ├─ paymentDate (Date)
-│  ├─ createdAt (Date)
-│  └─ canceledAt (Date)
+│  ├─ id (INT) [Primary Key, Auto Increment]
+│  ├─ eventId (VARCHAR(9)) [Indexed, Foreign Key]
+│  ├─ userId (VARCHAR(255)) [Indexed]
+│  ├─ seats (JSON)
+│  ├─ status (ENUM: PENDING, CONFIRMED, CANCELLED) [Indexed]
+│  ├─ eventDate (DATETIME)
+│  ├─ duration (INT)
+│  ├─ totalPrice (DECIMAL(10,2))
+│  ├─ seatPrice (DECIMAL(10,2))
+│  ├─ paymentStatus (ENUM: PENDING, COMPLETED, FAILED) [Indexed]
+│  ├─ paymentId (VARCHAR(255)) [Unique Index]
+│  ├─ paymentDate (DATETIME)
+│  ├─ canceledAt (DATETIME)
+│  ├─ createdAt (DATETIME)
+│  └─ updatedAt (DATETIME)
 │
-├─ seatLocks
-│  ├─ _id (ObjectId)
-│  ├─ eventId (String) [Indexed]
-│  ├─ seatId (String)
-│  ├─ eventDate (Date)
-│  ├─ duration (Number)
-│  └─ expiresAt (Date) [TTL Index: 600 seconds]
+├─ seatlocksqls
+│  ├─ id (INT) [Primary Key, Auto Increment]
+│  ├─ eventId (VARCHAR(9)) [Indexed, Foreign Key]
+│  ├─ seatId (VARCHAR(255))
+│  ├─ eventDate (DATETIME)
+│  ├─ duration (INT)
+│  ├─ expiresAt (DATETIME) [Indexed]
+│  └─ createdAt (DATETIME)
 │
 └─ prices
-   ├─ _id (ObjectId)
-   ├─ eventId (String) [Unique Index]
-   ├─ seatPrice (Number)
-   ├─ currency (String)
-   ├─ createdAt (Date)
-   └─ updatedAt (Date)
+   ├─ id (INT) [Primary Key, Auto Increment]
+   ├─ eventId (VARCHAR(9)) [Unique Index, Foreign Key]
+   ├─ seatPrice (DECIMAL(10,2))
+   ├─ currency (VARCHAR(10))
+   ├─ createdAt (DATETIME)
+   └─ updatedAt (DATETIME)
 ```
 
 ### Indexing Strategy
 
-| Collection | Field | Index Type | Purpose |
-|-----------|-------|-----------|---------|
+| Table | Field | Index Type | Purpose |
+|-------|-------|-----------|----------|
 | bookings | eventId | Regular | Fast event lookups |
 | bookings | userId | Regular | User's bookings |
 | bookings | paymentStatus | Regular | Payment filtering |
 | bookings | status | Regular | Status filtering |
 | bookings | paymentId | Unique | Prevent duplicate payments |
-| seatLocks | eventId | Regular | Find locks by event |
-| seatLocks | expiresAt | TTL (600s) | Auto-cleanup expired locks |
+| bookings | createdAt | Regular | Booking time filtering |
+| seatlocksqls | eventId, seatId | Composite | Find locks by event and seat |
+| seatlocksqls | expiresAt | Regular | Find expired locks for cleanup |
 | prices | eventId | Unique | One price per event |
+| events | date | Regular | Event date filtering |
+| events | city | Regular | City-based filtering |
 
 ---
 
@@ -1147,17 +1327,18 @@ TIME T=5 MIN: PAYMENT PROCESSED
 ├─ Runtime: Node.js
 ├─ Framework: Express.js
 ├─ Language: JavaScript (ES6+)
-├─ ORM: Mongoose
-├─ Database: MongoDB
+├─ ORM: Sequelize
+├─ Database: MySQL
 ├─ Package Manager: npm
 └─ Port: 3000 (default)
 ```
 
 ### Dependencies
-```
+```json
 {
   "express": "^4.18.x",
-  "mongoose": "^7.x.x",
+  "sequelize": "^6.x.x",
+  "mysql2": "^3.x.x",
   "dotenv": "^16.x.x"
 }
 ```
@@ -1190,7 +1371,7 @@ d:\PureSoftwares\
 
 **Prerequisites:**
 - Node.js v14+
-- MongoDB running locally or cloud instance
+- MySQL 5.7+ installed and running
 - npm or yarn
 
 **Installation:**
@@ -1201,9 +1382,24 @@ npm install
 **Configuration:**
 Create `.env` file:
 ```
-MONGODB_URI=mongodb://localhost:27017/event_booking_db
+DB_HOST=localhost
+DB_USER=root
+DB_PASSWORD=your_mysql_password
+DB_NAME=event_booking_db
 PORT=3000
 NODE_ENV=development
+```
+
+**Database Setup:**
+```bash
+# Option 1: Using migration script (recommended)
+npm run migrate
+
+# Option 2: Fresh start (drops and recreates all tables)
+npm run migrate:fresh
+
+# Option 3: Manual SQL
+mysql -u root -p < scripts/schema.sql
 ```
 
 **Run Server:**
@@ -1306,9 +1502,10 @@ npm test
    - Cache seat availability
 
 4. **Scalability**
-   - MongoDB sharding support
-   - Horizontal scaling ready
-   - Message queue for async operations (future)
+   - MySQL replication support
+   - Connection pooling ready
+   - Query optimization with proper indexing
+   - Horizontal scaling ready with multiple DB instances
 
 ---
 
@@ -1369,15 +1566,17 @@ npm test
 ## Deployment
 
 ### Prerequisites
-- MongoDB Atlas (cloud) or MongoDB installed
-- Node.js hosting (Heroku, AWS, Azure, etc)
+- MySQL 5.7+ installed locally or cloud hosted
+- Node.js hosting (Heroku, AWS, Azure, DigitalOcean, etc)
 - Environment variables configured
 
 ### Deployment Steps
 1. Push code to Git repository
-2. Set environment variables
-3. Install dependencies: `npm install`
-4. Run server: `npm start`
+2. Set environment variables (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME)
+3. Create database: `mysql -u root -p < scripts/schema.sql`
+4. Install dependencies: `npm install`
+5. Run migrations: `npm run migrate`
+6. Start server: `npm start`
 5. Verify API endpoints
 
 ---

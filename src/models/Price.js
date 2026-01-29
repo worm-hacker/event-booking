@@ -1,11 +1,40 @@
-const mongoose = require('mongoose');
+const { DataTypes } = require('sequelize');
 
-const PriceSchema = new mongoose.Schema({
-  eventId: { type: String, required: true },
-  seatPrice: { type: Number, required: true, default: 300 }, // Price in RS
-  currency: { type: String, default: 'RS' },
-  createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
-});
+module.exports = (sequelize) => {
+  const Price = sequelize.define('Price', {
+    id: {
+      type: DataTypes.INTEGER,
+      primaryKey: true,
+      autoIncrement: true
+    },
+    eventId: {
+      type: DataTypes.STRING(9),
+      allowNull: false,
+      unique: true,
+      index: true
+    },
+    seatPrice: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: false,
+      defaultValue: 300,
+      comment: 'Price in RS'
+    },
+    currency: {
+      type: DataTypes.STRING(10),
+      defaultValue: 'RS'
+    },
+    createdAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW
+    },
+    updatedAt: {
+      type: DataTypes.DATE,
+      defaultValue: DataTypes.NOW
+    }
+  }, {
+    tableName: 'prices',
+    timestamps: false
+  });
 
-module.exports = mongoose.model('Price', PriceSchema);
+  return Price;
+};
